@@ -278,6 +278,12 @@ export interface InstanceReader {
   getContractInstance(contractId: string): Promise<unknown>;
 }
 
+export interface ContractPresence {
+  exists: boolean;
+  detail: string | null;
+  error?: string;
+}
+
 /**
  * Has something already been deployed at this address?
  *
@@ -289,7 +295,7 @@ export interface InstanceReader {
 export async function contractAlreadyDeployed(
   server: InstanceReader,
   address: string,
-): Promise<{ exists: boolean; detail: string | null }> {
+): Promise<ContractPresence> {
   const trimmed = address.trim();
   if (!isContractAddress(trimmed)) {
     return { exists: false, detail: `${trimmed} is not a contract address yet` };
@@ -297,9 +303,22 @@ export async function contractAlreadyDeployed(
   try {
     await server.getContractInstance(trimmed);
     return { exists: true, detail: "a contract already lives at this address" };
-  } catch {
-    // Soroban RPC answers 404 for an unknown contract; either way the address is free.
-    return { exists: false, detail: null };
+  } catch (error) {
+    const rpcError = error as { code?: unknown; message?: unknown } | null;
+    if (rpcError && String(rpcError.code) === "404") {
+      // The SDK uses a structured 404 when the contract instance ledger key is absent.
+      return { exists: false, detail: null };
+    }
+    return {
+      exists: false,
+      detail: null,
+      error:
+        typeof rpcError?.message === "string"
+          ? rpcError.message
+          : error instanceof Error
+            ? error.message
+            : String(error),
+    };
   }
 }
 

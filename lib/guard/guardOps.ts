@@ -37,6 +37,7 @@ import {
 import { addressToScVal, hexToBytes } from "./scval.ts";
 import { announce } from "./useAnnounce.ts";
 import { recordTx } from "./txHistory.ts";
+import { contractAlreadyDeployed } from "./saltGenerator.ts";
 
 // ── Artifact identity ──────────────────────────────────────────────────────
 
@@ -49,6 +50,15 @@ export interface ArtifactCheck {
   /** True only when the live bytes hash to the pinned hash. */
   ok: boolean;
   detail: string;
+}
+
+/** The visible result for an existing predicted instance's bytecode. */
+export function describePinnedArtifactVerification(identity: WasmIdentity): string {
+  const matchesPinned =
+    identity.match &&
+    identity.fetchedSha256 === PHASE1_ARTIFACT.wasmHash &&
+    identity.bytes === PHASE1_ARTIFACT.wasmBytes;
+  return matchesPinned ? "matches the pinned artifact" : "does not match the pinned artifact";
 }
 
 /**
@@ -344,14 +354,26 @@ export async function deployGuard(params: {
     params.onStep?.(step);
   };
 
-  const artifact = await checkArtifact(server);
-  if (!artifact.ok) throw new GuardOperationError(artifact.detail);
-
   const predicted = await predictContractId({
     deployerPublicKey: signer.address,
     salt,
     ...(params.passphrase !== undefined ? { passphrase: params.passphrase } : {}),
   });
+
+  const presence = await contractAlreadyDeployed(server, predicted);
+  if (presence.error) {
+    throw new GuardOperationError(
+      `could not verify whether ${predicted} already exists: ${presence.error}`,
+    );
+  }
+  if (presence.exists) {
+    throw new GuardOperationError(
+      `a contract already exists at ${predicted}; change the deployer or salt to choose a new address`,
+    );
+  }
+
+  const artifact = await checkArtifact(server);
+  if (!artifact.ok) throw new GuardOperationError(artifact.detail);
 
   // ── Ensure the exact bytecode is a live code entry ─────────────────────
   const present = await artifactCodePresent(server, PHASE1_ARTIFACT.wasmHash);

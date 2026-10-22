@@ -338,12 +338,23 @@ test("a salt reused from an earlier deploy is caught before signing", async () =
   const free = await contractAlreadyDeployed(
     {
       getContractInstance: async () => {
-        throw new Error("not found");
+        throw { code: 404, message: "Could not obtain contract instance from server" };
       },
     },
     guard,
   );
   assert.deepEqual(free, { exists: false, detail: null });
+
+  const unreadable = await contractAlreadyDeployed(
+    {
+      getContractInstance: async () => {
+        throw new Error("RPC unavailable");
+      },
+    },
+    guard,
+  );
+  assert.equal(unreadable.exists, false);
+  assert.match(unreadable.error ?? "", /RPC unavailable/);
 });
 
 test("an address that has not been derived yet is not a collision", async () => {

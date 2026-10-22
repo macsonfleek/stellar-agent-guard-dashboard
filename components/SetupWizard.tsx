@@ -41,9 +41,12 @@ export function SetupWizard() {
   const dismissed = persisted.dismissed;
   const deployedMarker = persisted.deployedMarker;
 
-  const [initializedRead, setInitializedRead] = useState<ReadResult<boolean>>({
-    ok: false,
-    error: "reading initialize state…",
+  const [initializedRead, setInitializedRead] = useState<{
+    guard: string;
+    value: ReadResult<boolean>;
+  }>({
+    guard,
+    value: { ok: false, error: "reading initialize state…" },
   });
   // `initialize` is not exposed by `status()`, so it is read from the contract's
   // own storage. Demo mode makes no RPC call, so it reports that honestly rather
@@ -55,18 +58,20 @@ export function SetupWizard() {
             ok: false,
             error: "Demo mode shows static fixture data, so initialize state is not read.",
           }
-        : initializedRead,
-    [demo, initializedRead],
+        : initializedRead.guard === guard
+          ? initializedRead.value
+          : { ok: false, error: "reading initialize state…" },
+    [demo, guard, initializedRead],
   );
 
   // Held in component state (keyed by guard), never persisted: the verify step
   // derives from a live read the operator asked for, and a reload re-asks.
-  const [verification, setVerification] = useState<{
-    guard: string;
-    value: ReadResult<{ hasPolicy: boolean }> | null;
-  }>({ guard, value: null });
-  const verified = verification.guard === guard ? verification.value : null;
-  const [verifying, setVerifying] = useState(false);
+  const [verification, setVerification] = useState<
+    Record<string, ReadResult<{ hasPolicy: boolean }> | null>
+  >({});
+  const verified = verification[guard] ?? null;
+  const [verifyingState, setVerifyingState] = useState({ guard, busy: false });
+  const verifying = verifyingState.guard === guard && verifyingState.busy;
 
   useEffect(() => {
     if (demo) return;
@@ -74,12 +79,15 @@ export function SetupWizard() {
     void (async () => {
       try {
         const value = await isInitialized(server, guard);
-        if (!cancelled) setInitializedRead({ ok: true, value });
+        if (!cancelled) setInitializedRead({ guard, value: { ok: true, value } });
       } catch (error) {
         if (!cancelled) {
           setInitializedRead({
-            ok: false,
-            error: error instanceof Error ? error.message : String(error),
+            guard,
+            value: {
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+            },
           });
         }
       }
@@ -102,7 +110,7 @@ export function SetupWizard() {
   );
 
   const verify = useCallback(async () => {
-    setVerifying(true);
+    setVerifyingState({ guard, busy: true });
     try {
       // A live re-read, not the polled snapshot: the point of the step is that
       // the operator asked the chain right now.
@@ -110,15 +118,38 @@ export function SetupWizard() {
         readStatus(server, guard),
         readPolicy(server, guard),
       ]);
-      if (!status.ok) setVerification({ guard, value: { ok: false, error: status.error } });
-      else if (!policy.ok) setVerification({ guard, value: { ok: false, error: policy.error } });
+      if (!status.ok)
+        setVerification((current) => ({
+          ...current,
+          [guard]: { ok: false, error: status.error },
+        }));
+      else if (!policy.ok)
+        setVerification((current) => ({
+          ...current,
+          [guard]: { ok: false, error: policy.error },
+        }));
+      else if (status.value.has_policy !== (policy.value !== null))
+        setVerification((current) => ({
+          ...current,
+          [guard]: { ok: false, error: "status() and policy() disagree; retry the live read" },
+        }));
       else
-        setVerification({
-          guard,
-          value: { ok: true, value: { hasPolicy: status.value.has_policy } },
-        });
+        setVerification((current) => ({
+          ...current,
+          [guard]: { ok: true, value: { hasPolicy: status.value.has_policy } },
+        }));
+    } catch (error) {
+      setVerification((current) => ({
+        ...current,
+        [guard]: {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      }));
     } finally {
-      setVerifying(false);
+      setVerifyingState((current) =>
+        current.guard === guard ? { guard, busy: false } : current,
+      );
     }
   }, [server, guard]);
 

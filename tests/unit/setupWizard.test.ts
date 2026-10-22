@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { before, test } from "node:test";
+import { Address, xdr } from "@stellar/stellar-sdk";
+import { policyToScVal } from "stellar-agent-guard-sdk";
 import type { ReactElement } from "react";
 import { installDom, loadReact, sleep, type Act } from "./domHarness.ts";
 import { SetupWizard } from "../../components/SetupWizard.tsx";
@@ -8,6 +10,8 @@ import { GuardContext } from "../../components/GuardProvider.tsx";
 import type { GuardSnapshot } from "../../lib/guard/guardOps.ts";
 import { SETUP_STORAGE_KEY } from "../../lib/guard/setupChecklist.ts";
 import { PHASE1_ARTIFACT } from "../../lib/guard/network.ts";
+import { POLICY_PRESETS } from "../../lib/guard/presets.ts";
+import { guardStatusScVal } from "../mocks/sorobanFixtures.ts";
 
 installDom();
 
@@ -23,6 +27,8 @@ before(async () => {
 });
 
 const GUARD = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+const GUARD_A = "CBLQLJAG72M4XQRJMQHSKYIFVHQD7LNTNOQH2GRMCMBWMSLBSLTGTJC7";
+const GUARD_B = "CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB";
 
 /** A server whose every method rejects, so reads settle into their error states. */
 const noNetworkServer = new Proxy(
@@ -36,9 +42,9 @@ const noNetworkServer = new Proxy(
  * A mounted snapshot for a freshly deployed guard with no policy — the exact
  * state the checklist exists to surface: default-deny.
  */
-function policyMissingSnapshot(): GuardSnapshot {
+function policyMissingSnapshot(guard = GUARD): GuardSnapshot {
   return {
-    guard: GUARD,
+    guard,
     fetchedAt: new Date().toISOString(),
     status: {
       ok: true,
@@ -64,9 +70,12 @@ function policyMissingSnapshot(): GuardSnapshot {
   };
 }
 
-function contextValue(snapshot: GuardSnapshot) {
+function contextValue(
+  snapshot: GuardSnapshot,
+  options: { server?: unknown; guard?: string } = {},
+) {
   return {
-    server: noNetworkServer,
+    server: options.server ?? noNetworkServer,
     wallet: null,
     walletError: null,
     connecting: false,
@@ -76,7 +85,7 @@ function contextValue(snapshot: GuardSnapshot) {
       throw new Error("no signing in setup-wizard tests");
     },
     instances: [{ guard: GUARD, label: "Test guard", provenance: "test" }],
-    guard: GUARD,
+    guard: options.guard ?? GUARD,
     selectGuard: () => {},
     addInstance: () => {},
     snapshot,
@@ -107,14 +116,18 @@ interface Rendered {
   unmount: () => Promise<void>;
 }
 
-async function render(element: ReactElement, snapshot: GuardSnapshot): Promise<Rendered> {
+async function render(
+  element: ReactElement,
+  snapshot: GuardSnapshot,
+  options: { server?: unknown; guard?: string } = {},
+): Promise<Rendered & { rerender: (next: GuardSnapshot, nextOptions: { server?: unknown; guard?: string }) => Promise<void> }> {
   const container = document.createElement("div");
   document.body.appendChild(container);
   let root: ReturnType<typeof createRoot> | undefined;
   await act(async () => {
     root = createRoot(container);
     root.render(
-      react.createElement(GuardContext.Provider, { value: contextValue(snapshot) }, element),
+      react.createElement(GuardContext.Provider, { value: contextValue(snapshot, options) }, element),
     );
   });
   // Let mount effects (the initialize read) settle inside act.
@@ -123,6 +136,20 @@ async function render(element: ReactElement, snapshot: GuardSnapshot): Promise<R
   });
   return {
     container,
+    rerender: async (next, nextOptions) => {
+      await act(async () => {
+        root?.render(
+          react.createElement(
+            GuardContext.Provider,
+            { value: contextValue(next, nextOptions) },
+            element,
+          ),
+        );
+      });
+      await act(async () => {
+        await sleep(40);
+      });
+    },
     unmount: async () => {
       await act(async () => {
         root?.unmount();
@@ -148,6 +175,54 @@ async function click(container: HTMLElement, text: string): Promise<void> {
   await act(async () => {
     await sleep(40);
   });
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((accept) => {
+    resolve = accept;
+  });
+  return { promise, resolve };
+}
+
+function initializedInstance(value: boolean) {
+  return {
+    storage: [
+      {
+        key: { vec: [{ symbol: "Initialized" }] },
+        val: { bool: value },
+      },
+    ],
+  };
+}
+
+function decodeInvocation(transaction: unknown): { guard: string; fn: string } {
+  const envelope = xdr.TransactionEnvelope.fromXDR(
+    (transaction as { toXDR(): string }).toXDR(),
+    "base64",
+  );
+  const body = envelope.type === "envelopeTypeTx" ? envelope.v1.tx.operations[0]?.body : undefined;
+  const hostFunction =
+    body && body.type === "invokeHostFunction"
+      ? body.invokeHostFunctionOp.hostFunction
+      : undefined;
+  if (!hostFunction || hostFunction.type !== "hostFunctionTypeInvokeContract") {
+    return { guard: "", fn: "" };
+  }
+  const call = hostFunction.invokeContract;
+  return {
+    guard: Address.fromScAddress(call.contractAddress).toString(),
+    fn: String(call.functionName),
+  };
+}
+
+function simulatedRead(retval: xdr.ScVal) {
+  return {
+    transactionData: undefined,
+    minResourceFee: "1",
+    result: { auth: [], retval },
+    latestLedger: 1,
+  };
 }
 
 function step(container: HTMLElement, id: string): HTMLElement | null {
@@ -258,6 +333,180 @@ test("a failed verification re-read leaves step 4 in error, never optimistically
       const entry = (JSON.parse(raw) as Record<string, Record<string, unknown>>)[GUARD] ?? {};
       assert.deepEqual([...Object.keys(entry)].sort(), ["deployedMarker", "dismissed"]);
     }
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("a delayed initialize result from the previous guard is ignored", async () => {
+  const pending = new Map([
+    [GUARD_A, deferred<unknown>()],
+    [GUARD_B, deferred<unknown>()],
+  ]);
+  const server = {
+    getContractInstance: (guard: string) => pending.get(guard)!.promise,
+  };
+  const rendered = await render(react.createElement(SetupWizard), policyMissingSnapshot(GUARD_A), {
+    server,
+    guard: GUARD_A,
+  });
+  try {
+    await rendered.rerender(policyMissingSnapshot(GUARD_B), { server, guard: GUARD_B });
+    pending.get(GUARD_B)!.resolve(initializedInstance(true));
+    await act(async () => {
+      await sleep(40);
+    });
+    assert.equal(step(rendered.container, "initialized")?.dataset.state, "done");
+
+    pending.get(GUARD_A)!.resolve(initializedInstance(false));
+    await act(async () => {
+      await sleep(40);
+    });
+    assert.equal(
+      step(rendered.container, "initialized")?.dataset.state,
+      "done",
+      "the late result for guard A must not replace guard B's read",
+    );
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("a failed verification read can be retried without replaying a write", async () => {
+  let statusReads = 0;
+  let policyReads = 0;
+  let instanceReads = 0;
+  let writes = 0;
+  const server = {
+    async getContractInstance() {
+      instanceReads += 1;
+      return initializedInstance(true);
+    },
+    async simulateTransaction(transaction: unknown) {
+      const { fn } = decodeInvocation(transaction);
+      if (fn === "status") {
+        statusReads += 1;
+        if (statusReads === 1) throw new Error("status read temporarily unavailable");
+        return simulatedRead(
+          guardStatusScVal({
+            admin_frozen: false,
+            has_policy: true,
+            heartbeat_expired: false,
+            last_heartbeat: 1,
+            now: 2,
+          }),
+        );
+      }
+      if (fn === "policy") {
+        policyReads += 1;
+        return simulatedRead(policyToScVal(POLICY_PRESETS[0]!.config));
+      }
+      throw new Error(`unexpected contract function: ${fn}`);
+    },
+    async sendTransaction() {
+      writes += 1;
+      throw new Error("verification must not submit a transaction");
+    },
+  };
+  const rendered = await render(react.createElement(SetupWizard), policyMissingSnapshot(GUARD_A), {
+    server,
+    guard: GUARD_A,
+  });
+  try {
+    await click(rendered.container, "Re-verify status & policy");
+    assert.equal(step(rendered.container, "verified")?.dataset.state, "error");
+
+    await click(rendered.container, "Re-verify status & policy");
+    assert.equal(
+      step(rendered.container, "verified")?.dataset.state,
+      "done",
+      rendered.container.textContent ?? "",
+    );
+    assert.equal(statusReads, 2);
+    assert.equal(policyReads, 2);
+    assert.equal(instanceReads, 1, "verification retries only reads; it does not replay initialization");
+    assert.equal(writes, 0);
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("a late verification from the previous guard cannot replace the selected guard's result", async () => {
+  const pending = new Map<string, Map<string, ReturnType<typeof deferred<unknown>>>>();
+  for (const guard of [GUARD_A, GUARD_B]) {
+    pending.set(
+      guard,
+      new Map([
+        ["status", deferred<unknown>()],
+        ["policy", deferred<unknown>()],
+      ]),
+    );
+  }
+  const server = {
+    async getContractInstance() {
+      return initializedInstance(true);
+    },
+    simulateTransaction(transaction: unknown) {
+      const { guard, fn } = decodeInvocation(transaction);
+      return pending.get(guard)?.get(fn)?.promise ?? Promise.reject(new Error(`unexpected ${guard}.${fn}`));
+    },
+  };
+  const rendered = await render(
+    react.createElement(SetupWizard),
+    policyMissingSnapshot(GUARD_A),
+    { server, guard: GUARD_A },
+  );
+  try {
+    await click(rendered.container, "Re-verify status & policy");
+    await rendered.rerender(policyMissingSnapshot(GUARD_B), { server, guard: GUARD_B });
+    await click(rendered.container, "Re-verify status & policy");
+
+    pending
+      .get(GUARD_B)!
+      .get("status")!
+      .resolve(
+        simulatedRead(
+          guardStatusScVal({
+            admin_frozen: false,
+            has_policy: true,
+            heartbeat_expired: false,
+            last_heartbeat: 1,
+            now: 2,
+          }),
+        ),
+      );
+    pending
+      .get(GUARD_B)!
+      .get("policy")!
+      .resolve(simulatedRead(policyToScVal(POLICY_PRESETS[0]!.config)));
+    await act(async () => {
+      await sleep(40);
+    });
+    assert.equal(step(rendered.container, "verified")?.dataset.state, "done");
+
+    pending
+      .get(GUARD_A)!
+      .get("status")!
+      .resolve(
+        simulatedRead(
+          guardStatusScVal({
+            admin_frozen: false,
+            has_policy: false,
+            heartbeat_expired: false,
+            last_heartbeat: 1,
+            now: 2,
+          }),
+        ),
+      );
+    pending.get(GUARD_A)!.get("policy")!.resolve(simulatedRead(xdr.ScVal.scvVoid()));
+    await act(async () => {
+      await sleep(40);
+    });
+    assert.equal(
+      step(rendered.container, "verified")?.dataset.state,
+      "done",
+      "guard A's late verification must not replace guard B's result",
+    );
   } finally {
     await rendered.unmount();
   }

@@ -547,3 +547,98 @@ describe("wallet-bound write boundaries", () => {
     assert.deepEqual(sendCalls, ["sent"]);
   });
 });
+
+describe("invokeWithWallet source sequence reuse (issue #392)", () => {
+  it("uses the same base sequence for discovery, enforcement, and the exported envelope", async () => {
+    const sequences: string[] = [];
+    let accountReads = 0;
+    const simulation = {
+      transactionData: new SorobanDataBuilder()
+        .setReadWrite([])
+        .setResourceFee(1n)
+        .setResources(1, 0, 0)
+        .build(),
+      minResourceFee: "1",
+      result: { auth: [], retval: xdr.ScVal.scvVoid() },
+      latestLedger: 200,
+      events: [],
+      cost: { cpuInsns: "0", memBytes: "0" },
+      stateChanges: [],
+    };
+    const server = {
+      async getAccount() {
+        accountReads += 1;
+        return { sequenceNumber: () => "42" };
+      },
+      async simulateTransaction(transaction: { sequence: string }) {
+        sequences.push(transaction.sequence);
+        return simulation;
+      },
+      async sendTransaction() {
+        throw new Error("export-only invocation must not broadcast");
+      },
+    };
+    const result = await invokeWithWallet({
+      server: server as never,
+      contract: GUARD_CONTRACT,
+      fn: "set_policy",
+      args: [],
+      passphrase: PASSPHRASE,
+      exportOnly: true,
+      signer: {
+        address: SIGNER_ADDRESS,
+        signTransaction: async () => {
+          throw new Error("export-only invocation must not sign");
+        },
+        signAuthEntry: async () => {
+          throw new Error("empty authorization list must not prompt");
+        },
+      },
+    });
+
+    assert.equal(result.kind, "exported");
+    assert.equal(accountReads, 1);
+    assert.deepEqual(sequences, ["43", "43"], "each simulation starts from account sequence 42");
+    if (result.kind !== "exported") return;
+    const submitted = TransactionBuilder.fromXDR(result.xdr, PASSPHRASE) as Transaction;
+    assert.equal(submitted.sequence, sequences[1], "the final envelope matches enforced simulation");
+  });
+
+  it("does not build or broadcast a final envelope when discovery fails", async () => {
+    let simulations = 0;
+    let broadcasts = 0;
+    const server = {
+      async getAccount() {
+        return { sequenceNumber: () => "42" };
+      },
+      async simulateTransaction() {
+        simulations += 1;
+        return { status: "ERROR", error: "probe rejected" };
+      },
+      async sendTransaction() {
+        broadcasts += 1;
+        throw new Error("failed discovery must not broadcast");
+      },
+    };
+    const result = await invokeWithWallet({
+      server: server as never,
+      contract: GUARD_CONTRACT,
+      fn: "set_policy",
+      args: [],
+      passphrase: PASSPHRASE,
+      signer: {
+        address: SIGNER_ADDRESS,
+        signTransaction: async () => {
+          throw new Error("failed discovery must not sign");
+        },
+        signAuthEntry: async () => {
+          throw new Error("failed discovery must not sign");
+        },
+      },
+    });
+
+    assert.equal(result.kind, "refused");
+    assert.equal(simulations, 1);
+    assert.equal(broadcasts, 0);
+  });
+});

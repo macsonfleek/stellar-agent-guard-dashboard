@@ -11,7 +11,13 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { checkArtifact, deployGuard, initializeGuard, planDeploy } from "../lib/guard/guardOps.ts";
+import {
+  checkArtifact,
+  deployGuard,
+  describePinnedArtifactVerification,
+  initializeGuard,
+  planDeploy,
+} from "../lib/guard/guardOps.ts";
 import { rememberDeployment } from "../lib/guard/setupChecklist.ts";
 import type { ArtifactCheck, DeployOutcome, DeployPlan } from "../lib/guard/guardOps.ts";
 import { deployCostBreakdown } from "../lib/guard/deployCostCalculator.ts";
@@ -73,6 +79,16 @@ import { ErrorBlock, OutcomeList, starLink } from "./bits.tsx";
 
 /** Either the chain's answer about the artifact, or why there is not one. */
 type ArtifactFetch = { artifact: ArtifactCheck } | { error: string };
+type AddressInspection =
+  | { key: string; address: string; state: "checking" | "free" }
+  | { key: string; address: string; state: "unreadable"; error: string }
+  | {
+      key: string;
+      address: string;
+      state: "existing";
+      identity: Awaited<ReturnType<typeof verifyWasmIdentity>> | null;
+      error: string | null;
+    };
 
 // parked-until-upstream: #13
 // The multi-artifact version picker is blocked until the upstream stellar-agent-guard-contracts
@@ -121,9 +137,8 @@ export function DeployPanel() {
   // re-renders without becoming state.
   const cancelSearch = useRef({ aborted: false });
 
-  const [collision, setCollision] = useState<{ exists: boolean; detail: string | null } | null>(
-    null,
-  );
+  const [addressInspectionState, setAddressInspectionState] =
+    useState<AddressInspection | null>(null);
 
   const [balances, setBalances] = useState<BalanceReading[] | null>(null);
   const [checkingBalance, setCheckingBalance] = useState(false);
@@ -224,6 +239,13 @@ export function DeployPanel() {
 
   const planKey = wallet ? `${wallet.address}:${toHex(salt)}` : "";
   const plan = planFor?.key === planKey ? planFor.plan : null;
+  const predicted = plan?.predicted ?? "";
+  const addressInspectionKey = `${planKey}:${String(server.serverURL)}`;
+  const addressInspection = predicted
+    ? addressInspectionState?.key === addressInspectionKey
+      ? addressInspectionState
+      : { key: addressInspectionKey, address: predicted, state: "checking" as const }
+    : null;
   const deployCost =
     wallet && balance !== null
       ? deployCostBreakdown({
@@ -254,17 +276,51 @@ export function DeployPanel() {
   // Asked whether the predicted address is already taken, because the salt is
   // deterministic: reusing one from an earlier deployment is a collision the
   // chain would only report at signing time.
-  const predicted = plan?.predicted ?? "";
   useEffect(() => {
+    if (predicted === "") return;
     let cancelled = false;
     void (async () => {
-      const next = predicted === "" ? null : await contractAlreadyDeployed(server, predicted);
-      if (!cancelled) setCollision(next);
+      const presence = await contractAlreadyDeployed(server, predicted);
+      if (cancelled) return;
+      if (presence.error) {
+        setAddressInspectionState({
+          key: addressInspectionKey,
+          address: predicted,
+          state: "unreadable",
+          error: presence.error,
+        });
+        return;
+      }
+      if (!presence.exists) {
+        setAddressInspectionState({ key: addressInspectionKey, address: predicted, state: "free" });
+        return;
+      }
+      try {
+        const identity = await verifyWasmIdentity(server, predicted);
+        if (!cancelled)
+          setAddressInspectionState({
+            key: addressInspectionKey,
+            address: predicted,
+            state: "existing",
+            identity,
+            error: null,
+          });
+      } catch (error) {
+        if (!cancelled) {
+          setAddressInspectionState({
+            key: addressInspectionKey,
+            address: predicted,
+            state: "existing",
+            identity: null,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
     })();
     return () => {
       cancelled = true;
     };
-  }, [server, predicted]);
+  }, [server, predicted, addressInspectionKey]);
 
   /** Bound so the page keeps ownership of `fetch`; a bare reference can throw. */
   const fetchJson = useCallback<FetchLike>(async (url, init) => {
@@ -593,13 +649,34 @@ export function DeployPanel() {
         <p className="tiny muted">Working out the deploy plan...</p>
       )}
 
-      {collision?.exists && (
+      {addressInspection?.address === predicted && addressInspection.state === "checking" && (
+        <div className="notice info" role="status" style={{ marginTop: 8 }}>
+          Checking the predicted address on {NETWORK.name} before deployment...
+        </div>
+      )}
+
+      {addressInspection?.address === predicted && addressInspection.state === "unreadable" && (
+        <ErrorBlock
+          title="Predicted address could not be checked"
+          detail={`${addressInspection.error} — deployment stays disabled until a live read confirms the address is free.`}
+        />
+      )}
+
+      {addressInspection?.address === predicted && addressInspection.state === "existing" && (
         <div className="error" role="alert" style={{ marginTop: 8 }}>
-          <span className="t">Address already taken</span>
+          <span className="t">Address already in use on {NETWORK.name}</span>
           <span className="tiny">
-            A contract already lives at {predicted}. Generate a new salt or choose another before
-            signing — the deploy would fail on collision rather than overwrite anything.
+            A contract already lives at {predicted}. Deployment is disabled for this address; change
+            the deployer or salt to derive a different address.
           </span>
+          {addressInspection.identity ? (
+            <span className="tiny">
+              Bytecode {describePinnedArtifactVerification(addressInspection.identity)}: fetched
+              SHA-256 {addressInspection.identity.fetchedSha256} ({addressInspection.identity.bytes} bytes).
+            </span>
+          ) : (
+            <span className="tiny">Bytecode verification unavailable: {addressInspection.error}</span>
+          )}
         </div>
       )}
 
@@ -793,7 +870,12 @@ export function DeployPanel() {
 
       <div className="row" style={{ marginTop: 14 }}>
         <button
-          disabled={deployControl.disabled}
+          disabled={
+            deployControl.disabled ||
+            !predicted ||
+            addressInspection?.address !== predicted ||
+            addressInspection.state !== "free"
+          }
           title={deployControl.title}
           onClick={() => void deploy()}
         >

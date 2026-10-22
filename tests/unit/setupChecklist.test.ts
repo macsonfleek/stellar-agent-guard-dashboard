@@ -129,15 +129,33 @@ describe("read failures never look like success (issue #24)", () => {
     assert.match(step.detail, /rpc down/);
   });
 
-  it("the policy step is an error only when both status() and policy() are unreadable", () => {
-    const step = stepOf(
+  it("the policy step stays non-green if either required read fails or the reads disagree", () => {
+    const statusFailure = stepOf(
+      base({ status: fail("status unavailable"), policy: ok(POLICY) }),
+      "policy",
+    );
+    assert.equal(statusFailure.state, "error");
+    assert.match(statusFailure.detail, /status\(\): status unavailable/);
+
+    const policyFailure = stepOf(
+      base({ status: ok(status(true)), policy: fail("policy unavailable") }),
+      "policy",
+    );
+    assert.equal(policyFailure.state, "error");
+    assert.match(policyFailure.detail, /policy\(\): policy unavailable/);
+
+    const disagreement = stepOf(
+      base({ status: ok(status(false)), policy: ok(POLICY) }),
+      "policy",
+    );
+    assert.equal(disagreement.state, "error");
+    assert.match(disagreement.detail, /disagree/);
+
+    const bothFailures = stepOf(
       base({ status: fail("status unavailable"), policy: fail("policy unavailable") }),
       "policy",
     );
-    assert.equal(step.state, "error");
-    // If one read answers, it is used rather than degrading to an error.
-    assert.equal(stepOf(base({ status: fail("x"), policy: ok(POLICY) }), "policy").state, "done");
-    assert.equal(stepOf(base({ status: fail("x"), policy: ok(null) }), "policy").state, "pending");
+    assert.equal(bothFailures.state, "error");
   });
 
   it("a failed verification re-read stays an error/pending, never optimistically green", () => {
